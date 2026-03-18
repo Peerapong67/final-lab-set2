@@ -8,32 +8,90 @@ const router = express.Router();
 // Dummy hash สำหรับ timing-safe compare (ป้องกัน timing attack)
 const DUMMY_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8y0R6VQwWi4KFOeFHrgb3R04QLbL7a';
 
-// ── Helper: ส่ง log ไปที่ Log Service ──────────────────────────────────
-async function logEvent({ level, event, userId, ip, method, path, statusCode, message, meta }) {
+// ── Helper: บันทึก log ลง auth-db ─────────────────────────────────────
+async function logToDB({ level, event, userId, ip, message, meta }) {
   try {
-    await fetch('http://log-service:3003/api/logs/internal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        service:     'auth-service',
-        level,       event,
-        user_id:     userId      || null,
-        ip_address:  ip          || null,
-        method:      method      || null,
-        path:        path        || null,
-        status_code: statusCode  || null,
-        message:     message     || null,
-        meta:        meta        || null
-      })
-    });
-  } catch (_) { /* ถ้า log service ไม่ตอบ ไม่ต้องหยุดการทำงาน */ }
+    await pool.query(
+      `INSERT INTO logs (level, event, user_id, ip_address, message, meta)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [level, event, userId || null, ip || null, message || null,
+       meta ? JSON.stringify(meta) : null]
+    );
+  } catch (e) { console.error('[auth-log]', e.message); }
 }
 
+// ── Helper: ส่ง activity event ไปหา Activity Service (fire-and-forget) ──
+async function logActivity({ userId, username, eventType, entityType,
+                              entityId, summary, meta }) {
+  const ACTIVITY_URL = process.env.ACTIVITY_SERVICE_URL
+    || 'http://activity-service:3003';
+  fetch(`${ACTIVITY_URL}/api/activity/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      user_id: userId, username, event_type: eventType,
+      entity_type: entityType || null,
+      entity_id:   entityId   || null,
+      summary, meta: meta || null
+    })
+  }).catch(() => {
+    console.warn('[auth] activity-service unreachable — skipping event log');
+  });
+}
+
+// ── POST /api/auth/register ────────────────────────────────────────────
+router.post('/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  const ip = req.headers['x-forwarded-for'] || req.ip;
+
+  if (!username || !email || !password)
+    return res.status(400).json({ error: 'username, email, password are required' });
+  if (password.length < 6)
+    return res.status(400).json({ error: 'password ต้องมีอย่างน้อย 6 ตัวอักษร' });
+
+  try {
+    const exists = await pool.query(
+      'SELECT id FROM users WHERE email = $1 OR username = $2',
+      [email.toLowerCase().trim(), username.trim()]
+    );
+    if (exists.rows.length > 0)
+      return res.status(409).json({ error: 'Email หรือ Username ถูกใช้งานแล้ว' });
+
+    const hash   = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `INSERT INTO users (username, email, password_hash, role)
+       VALUES ($1,$2,$3,'member') RETURNING id, username, email, role, created_at`,
+      [username.trim(), email.toLowerCase().trim(), hash]
+    );
+    const user = result.rows[0];
+
+    await logToDB({
+      level: 'INFO', event: 'REGISTER_SUCCESS', userId: user.id, ip,
+      message: `New user registered: ${user.username}`
+    });
+
+    // ส่ง activity event (fire-and-forget)
+    logActivity({
+      userId: user.id, username: user.username,
+      eventType: 'USER_REGISTERED', entityType: 'user', entityId: user.id,
+      summary: `${user.username} สมัครสมาชิกใหม่`
+    });
+
+    res.status(201).json({
+      message: 'สมัครสมาชิกสำเร็จ',
+      user: { id: user.id, username: user.username,
+              email: user.email, role: user.role }
+    });
+  } catch (err) {
+    console.error('[auth] Register error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ── POST /api/auth/login ───────────────────────────────────────────────
-// ❌ ไม่มี /register — ใช้ Seed Users เท่านั้น
 router.post('/login', async (req, res) => {
   const { email, password } = req.body;
-  const ip = req.headers['x-real-ip'] || req.ip;
+  const ip = req.headers['x-forwarded-for'] || req.ip;
 
   if (!email || !password)
     return res.status(400).json({ error: 'กรุณากรอก email และ password' });
@@ -50,10 +108,8 @@ router.post('/login', async (req, res) => {
     const isValid = await bcrypt.compare(password, hash);
 
     if (!user || !isValid) {
-      await logEvent({
-        level: 'WARN', event: 'LOGIN_FAILED',
-        userId: user?.id || null, ip,
-        method: 'POST', path: '/api/auth/login', statusCode: 401,
+      await logToDB({
+        level: 'WARN', event: 'LOGIN_FAILED', ip,
         message: `Login failed: ${normalizedEmail}`,
         meta: { email: normalizedEmail }
       });
@@ -69,12 +125,16 @@ router.post('/login', async (req, res) => {
       username: user.username
     });
 
-    await logEvent({
-      level: 'INFO', event: 'LOGIN_SUCCESS',
-      userId: user.id, ip,
-      method: 'POST', path: '/api/auth/login', statusCode: 200,
-      message: `User ${user.username} logged in`,
-      meta: { username: user.username, role: user.role }
+    await logToDB({
+      level: 'INFO', event: 'LOGIN_SUCCESS', userId: user.id, ip,
+      message: `User ${user.username} logged in`
+    });
+
+    // ส่ง activity event (fire-and-forget)
+    logActivity({
+      userId: user.id, username: user.username,
+      eventType: 'USER_LOGIN', entityType: 'user', entityId: user.id,
+      summary: `${user.username} เข้าสู่ระบบ`
     });
 
     res.json({
