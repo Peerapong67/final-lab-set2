@@ -1,6 +1,7 @@
 const express  = require('express');
 const bcrypt   = require('bcryptjs');
-const { pool } = require('../db/db');
+const { Pool } = require('pg');
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const { generateToken, verifyToken } = require('../middleware/jwtUtils');
 
 const router = express.Router();
