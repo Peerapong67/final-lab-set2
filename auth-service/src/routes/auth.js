@@ -83,7 +83,7 @@ router.post('/register', async (req, res) => {
               email: user.email, role: user.role }
     });
   } catch (err) {
-    console.error('[auth] Register error:', err.message);
+    console.error('[auth] Register error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
