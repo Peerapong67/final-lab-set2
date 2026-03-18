@@ -4,23 +4,33 @@ const requireAuth = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-// Helper: ส่ง log ไปที่ Log Service
-async function logEvent({ level, event, userId, ip, method, path, statusCode, message, meta }) {
+// ── Helper: log ลง task-db ────────────────────────────────────────────
+async function logToDB({ level, event, userId, message, meta }) {
   try {
-    await fetch('http://log-service:3003/api/logs/internal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        service: 'task-service',
-        level, event,
-        user_id:    userId    || null,
-        ip_address: ip        || null,
-        method, path,
-        status_code: statusCode || null,
-        message, meta
-      })
-    });
-  } catch (_) {}
+    await pool.query(
+      `INSERT INTO logs (level, event, user_id, message, meta) VALUES ($1,$2,$3,$4,$5)`,
+      [level, event, userId || null, message || null,
+       meta ? JSON.stringify(meta) : null]
+    );
+  } catch (e) { console.error('[task-log]', e.message); }
+}
+
+// ── Helper: ส่ง activity event (fire-and-forget) ──────────────────────
+async function logActivity({ userId, username, eventType, entityId,
+                              summary, meta }) {
+  const ACTIVITY_URL = process.env.ACTIVITY_SERVICE_URL
+    || 'http://activity-service:3003';
+  fetch(`${ACTIVITY_URL}/api/activity/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      user_id: userId, username, event_type: eventType,
+      entity_type: 'task', entity_id: entityId || null,
+      summary, meta: meta || null
+    })
+  }).catch(() => {
+    console.warn('[task] activity-service unreachable — skipping event log');
+  });
 }
 
 // GET /api/tasks/health (ไม่ต้อง JWT)
@@ -29,21 +39,17 @@ router.get('/health', (_, res) => res.json({ status: 'ok', service: 'task-servic
 // ── ทุก route ต่อจากนี้ต้องผ่าน JWT ──
 router.use(requireAuth);
 
-// GET /api/tasks/ — admin เห็นทั้งหมด, member เห็นเฉพาะของตัวเอง
+// GET /api/tasks — admin เห็นทั้งหมด, member เห็นเฉพาะของตัวเอง
 router.get('/', async (req, res) => {
   try {
     let result;
     if (req.user.role === 'admin') {
       result = await pool.query(
-        `SELECT t.*, u.username FROM tasks t
-         JOIN users u ON t.user_id = u.id
-         ORDER BY t.created_at DESC`
+        `SELECT * FROM tasks ORDER BY created_at DESC`
       );
     } else {
       result = await pool.query(
-        `SELECT t.*, u.username FROM tasks t
-         JOIN users u ON t.user_id = u.id
-         WHERE t.user_id = $1 ORDER BY t.created_at DESC`,
+        `SELECT * FROM tasks WHERE user_id = $1 ORDER BY created_at DESC`,
         [req.user.sub]
       );
     }
@@ -53,7 +59,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/tasks/ — สร้าง task ใหม่
+// POST /api/tasks — สร้าง task ใหม่
 router.post('/', async (req, res) => {
   const { title, description, status = 'TODO', priority = 'medium' } = req.body;
   if (!title) return res.status(400).json({ error: 'title is required' });
@@ -65,11 +71,20 @@ router.post('/', async (req, res) => {
       [req.user.sub, title, description, status, priority]
     );
     const task = result.rows[0];
-    await logEvent({
+
+    await logToDB({
       level: 'INFO', event: 'TASK_CREATED', userId: req.user.sub,
-      method: 'POST', path: '/api/tasks', statusCode: 201,
       message: `Task created: "${title}"`, meta: { task_id: task.id, title }
     });
+
+    // fire-and-forget
+    logActivity({
+      userId: req.user.sub, username: req.user.username,
+      eventType: 'TASK_CREATED', entityId: task.id,
+      summary: `${req.user.username} สร้าง task "${title}"`,
+      meta: { task_id: task.id, title, priority }
+    });
+
     res.status(201).json({ task });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -86,6 +101,8 @@ router.put('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
 
     const { title, description, status, priority } = req.body;
+    const oldStatus = check.rows[0].status;
+
     const result = await pool.query(
       `UPDATE tasks
        SET title       = COALESCE($1, title),
@@ -96,7 +113,25 @@ router.put('/:id', async (req, res) => {
        WHERE id = $5 RETURNING *`,
       [title, description, status, priority, id]
     );
-    res.json({ task: result.rows[0] });
+    const task = result.rows[0];
+
+    // ถ้า status เปลี่ยน → log TASK_STATUS_CHANGED
+    if (status && status !== oldStatus) {
+      await logToDB({
+        level: 'INFO', event: 'TASK_STATUS_CHANGED', userId: req.user.sub,
+        message: `Task #${id} status changed: ${oldStatus} → ${status}`,
+        meta: { task_id: parseInt(id), old_status: oldStatus, new_status: status }
+      });
+
+      logActivity({
+        userId: req.user.sub, username: req.user.username,
+        eventType: 'TASK_STATUS_CHANGED', entityId: parseInt(id),
+        summary: `${req.user.username} เปลี่ยนสถานะ task #${id} เป็น ${status}`,
+        meta: { task_id: parseInt(id), old_status: oldStatus, new_status: status }
+      });
+    }
+
+    res.json({ task });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -112,11 +147,19 @@ router.delete('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
 
     await pool.query('DELETE FROM tasks WHERE id = $1', [id]);
-    await logEvent({
+
+    await logToDB({
       level: 'INFO', event: 'TASK_DELETED', userId: req.user.sub,
-      method: 'DELETE', path: `/api/tasks/${id}`, statusCode: 200,
-      message: `Task ${id} deleted`
+      message: `Task ${id} deleted`, meta: { task_id: parseInt(id) }
     });
+
+    logActivity({
+      userId: req.user.sub, username: req.user.username,
+      eventType: 'TASK_DELETED', entityId: parseInt(id),
+      summary: `${req.user.username} ลบ task #${id}`,
+      meta: { task_id: parseInt(id) }
+    });
+
     res.json({ message: 'Task deleted' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
